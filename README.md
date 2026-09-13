@@ -547,3 +547,87 @@ uv run ruff format && uv run ruff check && uv run ty check && uv run pytest
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
 
 Built with [FastAPI](https://fastapi.tiangolo.com/), [OpenAI Python SDK](https://github.com/openai/openai-python), [discord.py](https://github.com/Rapptz/discord.py), and [python-telegram-bot](https://python-telegram-bot.org/).
+
+### Machine–Mesh Protocol Manifest
+
+<!-- glacier-eq-protocol:start -->
+```yaml
+{
+  "schema": "glacier-eq.readme.machine-mesh/v1",
+  "repository": {
+    "id": "GlacierEQ/Apex-claude-code",
+    "url": "https://github.com/GlacierEQ/Apex-claude-code",
+    "readme_contract": "estate-machine-v1",
+    "default_branch": "main"
+  },
+  "machine": {
+    "repository_kind": "fork-or-derived-source",
+    "public_api": "inspect-declared-entrypoints",
+    "protocol_files": [],
+    "entrypoints": [
+      {
+        "kind": "package-contract",
+        "path": "pyproject.toml",
+        "policy": "inspect-before-use"
+      },
+      {
+        "kind": "test-area",
+        "path": "tests",
+        "policy": "run-before-reliance"
+      }
+    ]
+  },
+  "presentation": {
+    "architecture": [
+      "recruiter",
+      "master",
+      "machine",
+      "mesh"
+    ],
+    "authority": {
+      "capability": "stone-psysoc-x",
+      "repository": "GlacierEQ/AKOS",
+      "manifest": "stones/psysoc-x/stone.json",
+      "engine": "infinity_stones/psysoc_x.py"
+    },
+    "truth_invariant": "presentation-may-change-sequence-density-tone-and-style; facts-evidence-uncertainty-provenance-dignity-and-reader-agency-may-not"
+  },
+  "license": {
+    "class": "FORK_OR_UPSTREAM_DERIVED",
+    "status": "UPSTREAM_LICENSE_PRESENT_REVIEW_REQUIRED",
+    "controlling_path": "LICENSE",
+    "policy": "GlacierEQ/job-app-helix/LICENSE_POLICY.json",
+    "may_relicense_automatically": false,
+    "upstream_rights_must_be_preserved": true
+  },
+  "mesh": {
+    "primary_home": null,
+    "branch": "migration-residue",
+    "subcategory": "unresolved-primary-home",
+    "routing": [
+      {
+        "relation": "estate-map",
+        "target": "GlacierEQ/monolith",
+        "url": "https://github.com/GlacierEQ/monolith"
+      }
+    ],
+    "boundaries": [
+      "routing-does-not-transfer-source-code-evidence-deployment-or-lifecycle-authority",
+      "generated-contract-is-a-source-index-not-a-runtime-or-provider-receipt",
+      "implementation-and-provider-state-require-independent-evidence",
+      "presentation-calibration-cannot-promote-claim-or-evidence-state",
+      "license-automation-cannot-relicense-unresolved-upstream-or-third-party-rights"
+    ]
+  },
+  "provenance": {
+    "generated_by": "GlacierEQ/job-app-helix",
+    "generator_contract": "estate-machine-v1",
+    "classification_source": null,
+    "classification_evidence_path": null,
+    "classification_evidence_blob_sha": null,
+    "classification_status": null,
+    "contract_digest": "d98156998a674b7e359f140cde8d1844ace10c108fb180afb97c2c54043c4b86"
+  }
+}
+```
+<!-- glacier-eq-protocol:end -->
