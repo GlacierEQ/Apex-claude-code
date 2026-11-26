@@ -7,6 +7,38 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .nim import NimSettings
 
+# OpenAI-compatible cloud APIs that only need an API key: name -> (base URL, key page)
+OPENAI_COMPATIBLE_PRESETS = {
+    "groq": ("https://api.groq.com/openai/v1", "https://console.groq.com/keys"),
+    "cerebras": ("https://api.cerebras.ai/v1", "https://cloud.cerebras.ai"),
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "https://aistudio.google.com/apikey",
+    ),
+    "mistral": ("https://api.mistral.ai/v1", "https://console.mistral.ai/api-keys"),
+    "deepseek": (
+        "https://api.deepseek.com/v1",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    "together": (
+        "https://api.together.xyz/v1",
+        "https://api.together.ai/settings/api-keys",
+    ),
+}
+
+# /v1/models lists configured models as "<prefix><provider/model>". Claude Code's
+# model picker only keeps IDs containing "claude"; picking one routes to that model.
+MODEL_ID_PREFIX = "claude-fcc/"
+
+VALID_PROVIDERS = (
+    "nvidia_nim",
+    "open_router",
+    "lmstudio",
+    "ollama",
+    "custom",
+    *OPENAI_COMPATIBLE_PRESETS,
+)
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -28,6 +60,20 @@ class Settings(BaseSettings):
         default="http://localhost:1234/v1",
         validation_alias="LM_STUDIO_BASE_URL",
     )
+
+    # ==================== OpenAI-compatible providers ====================
+    groq_api_key: str = Field(default="", validation_alias="GROQ_API_KEY")
+    cerebras_api_key: str = Field(default="", validation_alias="CEREBRAS_API_KEY")
+    gemini_api_key: str = Field(default="", validation_alias="GEMINI_API_KEY")
+    mistral_api_key: str = Field(default="", validation_alias="MISTRAL_API_KEY")
+    deepseek_api_key: str = Field(default="", validation_alias="DEEPSEEK_API_KEY")
+    together_api_key: str = Field(default="", validation_alias="TOGETHER_API_KEY")
+    ollama_base_url: str = Field(
+        default="http://localhost:11434/v1", validation_alias="OLLAMA_BASE_URL"
+    )
+    # Any other OpenAI-compatible endpoint, used as MODEL="custom/<model>"
+    custom_base_url: str = Field(default="", validation_alias="CUSTOM_BASE_URL")
+    custom_api_key: str = Field(default="", validation_alias="CUSTOM_API_KEY")
 
     # ==================== Model ====================
     # All Claude model requests are mapped to this single model (fallback)
@@ -97,12 +143,20 @@ class Settings(BaseSettings):
         default=None, validation_alias="ALLOWED_DISCORD_CHANNELS"
     )
     claude_workspace: str = "./agent_workspace"
+    # Claude Code processes the bot runs at once; more tasks wait for a free slot
+    max_concurrent_cli: int = Field(
+        default=4, ge=1, validation_alias="MAX_CONCURRENT_CLI"
+    )
     allowed_dir: str = ""
 
     # ==================== Server ====================
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8082
     log_file: str = "server.log"
+    # DEBUG also logs full request payloads (prompts, file contents) to log_file
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    # Empty = no auth check. Clients send it as ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.
+    proxy_auth_token: str = Field(default="", validation_alias="PROXY_AUTH_TOKEN")
 
     # Handle empty strings for optional string fields
     @field_validator(
@@ -130,22 +184,24 @@ class Settings(BaseSettings):
     @field_validator("model", "model_opus", "model_sonnet", "model_haiku")
     @classmethod
     def validate_model_format(cls, v: str | None) -> str | None:
+        """Validate `provider/model`, or a comma-separated fallback chain of them."""
         if v is None:
             return None
-        valid_providers = ("nvidia_nim", "open_router", "lmstudio")
-        if "/" not in v:
-            raise ValueError(
-                f"Model must be prefixed with provider type. "
-                f"Valid providers: {', '.join(valid_providers)}. "
-                f"Format: provider_type/model/name"
-            )
-        provider = v.split("/", 1)[0]
-        if provider not in valid_providers:
-            raise ValueError(
-                f"Invalid provider: '{provider}'. "
-                f"Supported: 'nvidia_nim', 'open_router', 'lmstudio'"
-            )
-        return v
+        models = [m.strip() for m in v.split(",")]
+        for model in models:
+            if "/" not in model:
+                raise ValueError(
+                    f"Model must be prefixed with provider type. "
+                    f"Valid providers: {', '.join(VALID_PROVIDERS)}. "
+                    f"Format: provider_type/model/name"
+                )
+            provider = model.split("/", 1)[0]
+            if provider not in VALID_PROVIDERS:
+                raise ValueError(
+                    f"Invalid provider: '{provider}'. "
+                    f"Supported: {', '.join(VALID_PROVIDERS)}"
+                )
+        return ",".join(models)
 
     @model_validator(mode="after")
     def check_nvidia_nim_api_key(self) -> Settings:
@@ -176,6 +232,9 @@ class Settings(BaseSettings):
         Classifies the incoming Claude model (opus/sonnet/haiku) and
         returns the model-specific override if configured, otherwise the fallback MODEL.
         """
+        picked = claude_model_name.removeprefix(MODEL_ID_PREFIX)
+        if picked != claude_model_name and picked.split("/", 1)[0] in VALID_PROVIDERS:
+            return picked  # chosen in Claude Code's /model picker
         name_lower = claude_model_name.lower()
         if "opus" in name_lower and self.model_opus is not None:
             return self.model_opus
@@ -184,6 +243,21 @@ class Settings(BaseSettings):
         if "sonnet" in name_lower and self.model_sonnet is not None:
             return self.model_sonnet
         return self.model
+
+    def configured_models(self) -> dict[str, list[str]]:
+        """Every model in MODEL/MODEL_* (chains included) -> the settings using it."""
+        models: dict[str, list[str]] = {}
+        for setting, value in (
+            ("MODEL_OPUS", self.model_opus),
+            ("MODEL_SONNET", self.model_sonnet),
+            ("MODEL_HAIKU", self.model_haiku),
+            ("MODEL", self.model),
+        ):
+            for i, model in enumerate((value or "").split(",") if value else []):
+                models.setdefault(model, []).append(
+                    setting if i == 0 else f"{setting} fallback {i}"
+                )
+        return models
 
     @staticmethod
     def parse_provider_type(model_string: str) -> str:

@@ -39,7 +39,20 @@ class AnthropicToOpenAIConverter:
             role = msg.role
             content = msg.content
 
-            if isinstance(content, str):
+            if role == "system":
+                # Many OpenAI-compatible models only accept a leading system message;
+                # Claude Code itself falls back to user-turn reminders, so do the same.
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else "\n".join(
+                        get_block_attr(b, "text", "")
+                        for b in content
+                        if get_block_type(b) == "text"
+                    )
+                )
+                result.append({"role": "user", "content": text})
+            elif isinstance(content, str):
                 result.append({"role": role, "content": content})
             elif isinstance(content, list):
                 if role == "assistant":
@@ -116,24 +129,37 @@ class AnthropicToOpenAIConverter:
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
         """Convert user message blocks (including tool results), preserving order."""
         result: list[dict[str, Any]] = []
-        text_parts: list[str] = []
+        parts: list[dict[str, Any]] = []
 
-        def flush_text() -> None:
-            if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
-                text_parts.clear()
+        def flush_parts() -> None:
+            if parts:
+                if all(p["type"] == "text" for p in parts):
+                    content: Any = "\n".join(p["text"] for p in parts)
+                else:
+                    content = list(parts)
+                result.append({"role": "user", "content": content})
+                parts.clear()
 
         for block in content:
             block_type = get_block_type(block)
 
             if block_type == "text":
-                text_parts.append(get_block_attr(block, "text", ""))
+                parts.append(
+                    {"type": "text", "text": get_block_attr(block, "text", "")}
+                )
+            elif block_type == "image":
+                url = image_url(get_block_attr(block, "source", {}))
+                if url:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
             elif block_type == "tool_result":
-                flush_text()
+                flush_parts()
                 tool_content = get_block_attr(block, "content", "")
                 if isinstance(tool_content, list):
+                    # OpenAI tool messages are text-only: never inline base64 images.
                     tool_content = "\n".join(
-                        item.get("text", str(item))
+                        IMAGE_PLACEHOLDER
+                        if isinstance(item, dict) and item.get("type") == "image"
+                        else item.get("text", str(item))
                         if isinstance(item, dict)
                         else str(item)
                         for item in tool_content
@@ -146,7 +172,7 @@ class AnthropicToOpenAIConverter:
                     }
                 )
 
-        flush_text()
+        flush_parts()
         return result
 
     @staticmethod
@@ -178,6 +204,49 @@ class AnthropicToOpenAIConverter:
             if text_parts:
                 return {"role": "system", "content": "\n\n".join(text_parts).strip()}
         return None
+
+
+IMAGE_PLACEHOLDER = "[image omitted]"
+
+
+def image_url(source: dict[str, Any]) -> str | None:
+    """Anthropic image source (base64 or url) -> OpenAI image_url URL."""
+    if source.get("type") == "base64" and source.get("data"):
+        return f"data:{source.get('media_type', 'image/png')};base64,{source['data']}"
+    if source.get("type") == "url":
+        return source.get("url")
+    return None
+
+
+def has_images(body: dict[str, Any]) -> bool:
+    """Whether an OpenAI request body contains image_url parts."""
+    return any(
+        isinstance(m.get("content"), list)
+        and any(p.get("type") == "image_url" for p in m["content"])
+        for m in body.get("messages", [])
+    )
+
+
+def strip_images(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy of an OpenAI request body with image parts replaced by a text placeholder."""
+    messages = []
+    for m in body.get("messages", []):
+        if isinstance(m.get("content"), list):
+            text = "\n".join(
+                IMAGE_PLACEHOLDER if p.get("type") == "image_url" else p.get("text", "")
+                for p in m["content"]
+            )
+            m = {**m, "content": text}
+        messages.append(m)
+    return {**body, "messages": messages}
+
+
+def convert_tool_choice(choice: dict[str, Any]) -> str | dict[str, Any] | None:
+    """Map Anthropic tool_choice ({"type": auto|any|tool|none}) to OpenAI's format."""
+    kind = choice.get("type")
+    if kind == "tool":
+        return {"type": "function", "function": {"name": choice.get("name")}}
+    return {"auto": "auto", "any": "required", "none": "none"}.get(kind)
 
 
 def build_base_request_body(
@@ -219,8 +288,9 @@ def build_base_request_body(
     tools = getattr(request_data, "tools", None)
     if tools:
         body["tools"] = AnthropicToOpenAIConverter.convert_tools(tools)
-    tool_choice = getattr(request_data, "tool_choice", None)
-    if tool_choice:
-        body["tool_choice"] = tool_choice
+        # OpenAI rejects tool_choice without tools, so only map it alongside them.
+        tool_choice = getattr(request_data, "tool_choice", None)
+        if tool_choice:
+            set_if_not_none(body, "tool_choice", convert_tool_choice(tool_choice))
 
     return body

@@ -20,7 +20,7 @@ os.environ["PTB_TIMEDELTA"] = "1"
 
 # Configure logging first (before any module logs)
 _settings = get_settings()
-configure_logging(_settings.log_file)
+configure_logging(_settings.log_file, level=_settings.log_level.upper())
 
 
 _SHUTDOWN_TIMEOUT_S = 5.0
@@ -89,6 +89,8 @@ async def lifespan(app: FastAPI):
                 api_url=api_url,
                 allowed_dirs=allowed_dirs,
                 plans_directory=plans_directory,
+                auth_token=settings.proxy_auth_token,
+                max_concurrent=settings.max_concurrent_cli,
             )
 
             # Initialize session store

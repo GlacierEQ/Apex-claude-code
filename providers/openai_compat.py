@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from providers.base import BaseProvider, ProviderConfig
 from providers.common import (
@@ -21,7 +21,10 @@ from providers.common import (
     map_error,
     map_stop_reason,
 )
-from providers.rate_limit import GlobalRateLimiter
+from providers.common.message_converter import has_images, strip_images
+from providers.common.utils import max_tokens_limit
+from providers.exceptions import RateLimitError
+from providers.rate_limit import ProviderRateLimiter
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -41,7 +44,10 @@ class OpenAICompatibleProvider(BaseProvider):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._nim_settings = nim_settings
-        self._global_rate_limiter = GlobalRateLimiter.get_instance(
+        # Learned from 400s: models without image input, and their max output tokens.
+        self._text_only_models: set[str] = set()
+        self._max_tokens_caps: dict[str, int] = {}
+        self._rate_limiter = ProviderRateLimiter(
             rate_limit=config.rate_limit,
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
@@ -58,11 +64,15 @@ class OpenAICompatibleProvider(BaseProvider):
             ),
         )
 
+    async def list_models(self) -> list[str]:
+        """Model IDs from the provider's OpenAI-compatible /models endpoint."""
+        return sorted([model.id async for model in self._client.models.list()])
+
     async def cleanup(self) -> None:
         """Release HTTP client resources."""
         client = getattr(self, "_client", None)
         if client is not None:
-            await client.aclose()
+            await client.close()
 
     @abstractmethod
     def _build_request_body(self, request: Any) -> dict:
@@ -78,28 +88,26 @@ class OpenAICompatibleProvider(BaseProvider):
         if tc_index < 0:
             tc_index = len(sse.blocks.tool_states)
 
-        fn_delta = tc.get("function", {})
+        fn_delta = tc.get("function") or {}
         incoming_name = fn_delta.get("name")
-        if incoming_name is not None:
-            sse.blocks.register_tool_name(tc_index, incoming_name)
+        if incoming_name is not None or tc_index not in sse.blocks.tool_states:
+            sse.blocks.register_tool_name(tc_index, incoming_name or "")
+        state = sse.blocks.tool_states[tc_index]
+        if tc.get("id") and not state.started:
+            state.tool_id = tc["id"]
 
-        state = sse.blocks.tool_states.get(tc_index)
-        if state is None or not state.started:
-            name = state.name if state else ""
-            if name or tc.get("id"):
-                tool_id = tc.get("id") or f"tool_{uuid.uuid4()}"
-                yield sse.start_tool_block(tc_index, tool_id, name)
-
-        args = fn_delta.get("arguments", "")
+        # Start the block on the first arguments: by then the name, which some
+        # providers send after the id or in fragments, is complete.
+        args = fn_delta.get("arguments")
         if args:
-            state = sse.blocks.tool_states.get(tc_index)
-            if state is None or not state.started:
-                tool_id = tc.get("id") or f"tool_{uuid.uuid4()}"
-                name = (state.name if state else None) or "tool_call"
-                yield sse.start_tool_block(tc_index, tool_id, name)
-                state = sse.blocks.tool_states.get(tc_index)
+            if not state.started:
+                yield sse.start_tool_block(
+                    tc_index,
+                    state.tool_id or f"tool_{uuid.uuid4()}",
+                    state.name or "tool_call",
+                )
 
-            current_name = state.name if state else ""
+            current_name = state.name
             if current_name == "Task":
                 parsed = sse.blocks.buffer_task_args(tc_index, args)
                 if parsed is not None:
@@ -107,6 +115,33 @@ class OpenAICompatibleProvider(BaseProvider):
                 return
 
             yield sse.emit_tool_delta(tc_index, args)
+
+    async def _open_stream(self, body: dict, tag: str) -> Any:
+        """Start the stream, retrying 400s we can fix: output limit, then images."""
+        while True:
+            try:
+                return await self._rate_limiter.execute_with_retry(
+                    self._client.chat.completions.create, **body, stream=True
+                )
+            except BadRequestError as e:
+                fixed = self._fix_bad_request(body, str(e), tag)
+                if fixed is None:
+                    raise
+                body = fixed  # each fix strictly shrinks the request, so this ends
+
+    def _fix_bad_request(self, body: dict, error: str, tag: str) -> dict | None:
+        """A smaller request the provider should accept, remembered per model, or None."""
+        model = body.get("model", "")
+        limit = max_tokens_limit(error, body.get("max_tokens"))
+        if limit:
+            logger.warning("{}: {} allows max_tokens={}, retrying", tag, model, limit)
+            self._max_tokens_caps[model] = limit
+            return {**body, "max_tokens": limit}
+        if has_images(body):
+            logger.warning("{}: {} rejected images, retrying without", tag, model)
+            self._text_only_models.add(model)
+            return strip_images(body)
+        return None
 
     def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
         """Emit buffered Task args as a single JSON delta (best-effort)."""
@@ -119,11 +154,12 @@ class OpenAICompatibleProvider(BaseProvider):
         input_tokens: int = 0,
         *,
         request_id: str | None = None,
+        raise_before_output: bool = False,
     ) -> AsyncIterator[str]:
         """Stream response in Anthropic SSE format."""
         with logger.contextualize(request_id=request_id):
             async for event in self._stream_response_impl(
-                request, input_tokens, request_id
+                request, input_tokens, request_id, raise_before_output
             ):
                 yield event
 
@@ -132,6 +168,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request: Any,
         input_tokens: int,
         request_id: str | None,
+        raise_before_output: bool = False,
     ) -> AsyncIterator[str]:
         """Shared streaming implementation."""
         tag = self._provider_name
@@ -139,6 +176,12 @@ class OpenAICompatibleProvider(BaseProvider):
         sse = SSEBuilder(message_id, request.model, input_tokens)
 
         body = self._build_request_body(request)
+        model = body.get("model", "")
+        if model in self._text_only_models:
+            body = strip_images(body)
+        cap = self._max_tokens_caps.get(model)
+        if cap and body.get("max_tokens", 0) > cap:
+            body["max_tokens"] = cap
         req_tag = f" request_id={request_id}" if request_id else ""
         logger.info(
             "{}_STREAM:{} model={} msgs={} tools={}",
@@ -155,15 +198,12 @@ class OpenAICompatibleProvider(BaseProvider):
         heuristic_parser = HeuristicToolParser()
 
         finish_reason = None
+        text_tool_calls = 0
         usage_info = None
-        error_occurred = False
-        error_message = ""
 
-        async with self._global_rate_limiter.concurrency_slot():
+        async with self._rate_limiter.concurrency_slot():
             try:
-                stream = await self._global_rate_limiter.execute_with_retry(
-                    self._client.chat.completions.create, **body, stream=True
-                )
+                stream = await self._open_stream(body, tag)
                 async for chunk in stream:
                     if getattr(chunk, "usage", None):
                         usage_info = chunk.usage
@@ -172,13 +212,14 @@ class OpenAICompatibleProvider(BaseProvider):
                         continue
 
                     choice = chunk.choices[0]
-                    delta = choice.delta
-                    if delta is None:
-                        continue
-
+                    # Read before the delta check: some providers end with delta=None.
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
                         logger.debug("{} finish_reason: {}", tag, finish_reason)
+
+                    delta = choice.delta
+                    if delta is None:
+                        continue
 
                     # Handle reasoning_content (OpenAI extended format)
                     reasoning = getattr(delta, "reasoning_content", None)
@@ -209,6 +250,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                     yield sse.emit_text_delta(filtered_text)
 
                                 for tool_use in detected_tools:
+                                    text_tool_calls += 1
                                     for event in sse.close_content_blocks():
                                         yield event
 
@@ -235,12 +277,13 @@ class OpenAICompatibleProvider(BaseProvider):
                         for event in sse.close_content_blocks():
                             yield event
                         for tc in delta.tool_calls:
+                            fn = tc.function  # None on id-only deltas
                             tc_info = {
                                 "index": tc.index,
                                 "id": tc.id,
                                 "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
+                                    "name": fn.name if fn else None,
+                                    "arguments": fn.arguments if fn else None,
                                 },
                             }
                             for event in self._process_tool_call(tc_info, sse):
@@ -249,7 +292,10 @@ class OpenAICompatibleProvider(BaseProvider):
             except Exception as e:
                 logger.error("{}_ERROR:{} {}: {}", tag, req_tag, type(e).__name__, e)
                 mapped_e = map_error(e)
-                error_occurred = True
+                if isinstance(mapped_e, RateLimitError):
+                    self._rate_limiter.set_blocked(60)  # cool down this provider only
+                if raise_before_output and sse.blocks.next_index == 0:
+                    raise mapped_e from e
                 error_message = append_request_id(
                     get_user_facing_error_message(
                         mapped_e, read_timeout_s=self._config.http_read_timeout
@@ -262,10 +308,12 @@ class OpenAICompatibleProvider(BaseProvider):
                     type(e).__name__,
                     req_tag,
                 )
-                for event in sse.close_content_blocks():
-                    yield event
-                for event in sse.emit_error(error_message):
-                    yield event
+                # Open blocks stay open: Claude Code keeps only completed blocks, so a
+                # half-streamed tool call is never run with cut-off arguments.
+                yield sse.error_event(
+                    getattr(mapped_e, "error_type", "api_error"), error_message
+                )
+                return
 
         # Flush remaining content
         remaining = think_parser.flush()
@@ -280,6 +328,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 yield sse.emit_text_delta(remaining.content)
 
         for tool_use in heuristic_parser.flush():
+            text_tool_calls += 1
             for event in sse.close_content_blocks():
                 yield event
 
@@ -301,14 +350,17 @@ class OpenAICompatibleProvider(BaseProvider):
             )
             yield sse.content_block_stop(block_idx)
 
-        if (
-            not error_occurred
-            and sse.blocks.text_index == -1
-            and not sse.blocks.tool_states
-        ):
+        if sse.blocks.text_index == -1 and not sse.blocks.tool_states:
             for event in sse.ensure_text_block():
                 yield event
             yield sse.emit_text_delta(" ")
+
+        # Tools that never received arguments still need their block.
+        for index, state in list(sse.blocks.tool_states.items()):
+            if not state.started and state.name:
+                yield sse.start_tool_block(
+                    index, state.tool_id or f"tool_{uuid.uuid4()}", state.name
+                )
 
         for event in self._flush_task_arg_buffers(sse):
             yield event
@@ -330,5 +382,9 @@ class OpenAICompatibleProvider(BaseProvider):
                     provider_input,
                     provider_input - input_tokens,
                 )
-        yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
+        stop_reason = map_stop_reason(finish_reason)
+        # Text-parsed tool calls, and some providers' native ones, end with "stop".
+        if stop_reason == "end_turn" and (text_tool_calls or sse.blocks.tool_states):
+            stop_reason = "tool_use"
+        yield sse.message_delta(stop_reason, output_tokens)
         yield sse.message_stop()

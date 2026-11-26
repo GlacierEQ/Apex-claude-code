@@ -16,7 +16,7 @@ class ProviderConfig(BaseModel):
 
     api_key: str
     base_url: str | None = None
-    rate_limit: int | None = None
+    rate_limit: int = 40
     rate_window: int = 60
     max_concurrency: int = 5
     http_read_timeout: float = 300.0
@@ -34,6 +34,10 @@ class BaseProvider(ABC):
     async def cleanup(self) -> None:
         """Release any resources held by this provider."""
 
+    async def list_models(self) -> list[str]:
+        """Model IDs this provider offers (used by claude-pick)."""
+        raise NotImplementedError
+
     @abstractmethod
     async def stream_response(
         self,
@@ -41,7 +45,12 @@ class BaseProvider(ABC):
         input_tokens: int = 0,
         *,
         request_id: str | None = None,
+        raise_before_output: bool = False,
     ) -> AsyncIterator[str]:
-        """Stream response in Anthropic SSE format."""
+        """Stream response in Anthropic SSE format.
+
+        With raise_before_output, an error before any content block is raised
+        (so the caller can fall back) instead of streamed as an error message.
+        """
         if False:
             yield ""  # Required for ty/mypy to accept abstract async generator

@@ -1,6 +1,7 @@
 """Claude Code CLI session management."""
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import AsyncGenerator
@@ -20,8 +21,13 @@ class CLISession:
         api_url: str,
         allowed_dirs: list[str] | None = None,
         plans_directory: str | None = None,
+        auth_token: str = "",
+        process_slots: asyncio.Semaphore | None = None,
     ):
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
+        # Shared across sessions: caps how many CLI processes run at once.
+        self._process_slots = process_slots or contextlib.nullcontext()
+        self.auth_token = auth_token
         self.api_url = api_url
         self.allowed_dirs = [os.path.normpath(d) for d in (allowed_dirs or [])]
         self.plans_directory = plans_directory
@@ -48,11 +54,13 @@ class CLISession:
         Yields:
             Event dictionaries from the CLI
         """
-        async with self._cli_lock:
+        async with self._cli_lock, self._process_slots:
             self._is_busy = True
             env = os.environ.copy()
 
-            if "ANTHROPIC_API_KEY" not in env:
+            if self.auth_token:
+                env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_AUTH_TOKEN"] = self.auth_token
+            elif "ANTHROPIC_API_KEY" not in env:
                 env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
 
             env["ANTHROPIC_API_URL"] = self.api_url
@@ -119,6 +127,13 @@ class CLISession:
 
                 session_id_extracted = False
                 buffer = bytearray()
+                # Drain stderr while reading stdout: a full stderr pipe would block
+                # the CLI and it would never close stdout (deadlock).
+                stderr_task = (
+                    asyncio.create_task(self.process.stderr.read())
+                    if self.process.stderr
+                    else None
+                )
 
                 try:
                     while True:
@@ -161,11 +176,13 @@ class CLISession:
                     try:
                         await asyncio.shield(self.stop())
                     finally:
+                        if stderr_task:
+                            stderr_task.cancel()
                         raise
 
                 stderr_text = None
-                if self.process.stderr:
-                    stderr_output = await self.process.stderr.read()
+                if stderr_task:
+                    stderr_output = await stderr_task
                     if stderr_output:
                         stderr_text = stderr_output.decode(
                             "utf-8", errors="replace"

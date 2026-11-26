@@ -45,9 +45,9 @@ def open_router_config():
 
 @pytest.fixture(autouse=True)
 def mock_rate_limiter():
-    """Mock the global rate limiter to prevent waiting."""
-    with patch("providers.openai_compat.GlobalRateLimiter") as mock:
-        instance = mock.get_instance.return_value
+    """Mock the provider rate limiter to prevent waiting."""
+    with patch("providers.openai_compat.ProviderRateLimiter") as mock:
+        instance = mock.return_value
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
         async def _passthrough(fn, *args, **kwargs):
@@ -314,9 +314,9 @@ async def test_stream_response_error_path(open_router_provider):
     ) as mock_create:
         mock_create.return_value = mock_stream()
         events = [e async for e in open_router_provider.stream_response(req)]
-        # Error is emitted; message_stop/done indicates stream completed
+        # The stream ends with an Anthropic error event
         assert any("API failed" in e for e in events)
-        assert any("message_stop" in e for e in events)
+        assert events[-1].startswith("event: error")
 
 
 @pytest.mark.asyncio

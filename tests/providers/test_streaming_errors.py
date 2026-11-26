@@ -4,6 +4,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import openai
 import pytest
 
 from config.nim import NimSettings
@@ -103,7 +104,7 @@ class TestStreamingExceptionHandling:
                 side_effect=RuntimeError("API failed"),
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -111,11 +112,12 @@ class TestStreamingExceptionHandling:
         ):
             events = await _collect_stream(provider, request)
 
-        # Should have message_start, error text block, close blocks, message_delta, message_stop
+        # message_start, then an Anthropic error event that ends the stream
         event_text = "".join(events)
         assert "message_start" in event_text
         assert "API failed" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     @pytest.mark.asyncio
     async def test_read_timeout_with_empty_message_emits_fallback(self):
@@ -131,7 +133,7 @@ class TestStreamingExceptionHandling:
                 side_effect=httpx.ReadTimeout(""),
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -148,7 +150,8 @@ class TestStreamingExceptionHandling:
         event_text = "".join(events)
         assert "timed out after" in event_text
         assert "request_id=req_timeout123" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     @pytest.mark.asyncio
     async def test_error_after_partial_content(self):
@@ -167,7 +170,7 @@ class TestStreamingExceptionHandling:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -178,7 +181,8 @@ class TestStreamingExceptionHandling:
         event_text = "".join(events)
         assert "Hello" in event_text
         assert "Connection lost" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     @pytest.mark.asyncio
     async def test_empty_response_gets_space(self):
@@ -197,7 +201,7 @@ class TestStreamingExceptionHandling:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -227,7 +231,7 @@ class TestStreamingExceptionHandling:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -259,7 +263,7 @@ class TestStreamingExceptionHandling:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -293,7 +297,7 @@ class TestStreamingExceptionHandling:
                 return await fn(*args, **kwargs)
 
             with patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "execute_with_retry",
                 new_callable=AsyncMock,
                 side_effect=_passthrough,
@@ -302,6 +306,180 @@ class TestStreamingExceptionHandling:
 
         event_text = "".join(events)
         assert "Response" in event_text
+
+    @pytest.mark.asyncio
+    async def test_429_blocks_only_this_provider(self):
+        """A 429 that exhausts retries cools down this provider, not others."""
+        provider, other = _make_provider(), _make_provider()
+        response = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+        error = openai.RateLimitError("rate limited", response=response, body=None)
+
+        with patch.object(
+            provider._rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=error,
+        ):
+            await _collect_stream(provider, _make_request())
+
+        assert provider._rate_limiter.is_blocked()
+        assert not other._rate_limiter.is_blocked()
+
+
+def _tool_delta(index=0, id=None, name=None, arguments=None, function=True):
+    tc = MagicMock()
+    tc.index, tc.id = index, id
+    if function:
+        tc.function.name, tc.function.arguments = name, arguments
+    else:
+        tc.function = None
+    return tc
+
+
+async def _stream_chunks(chunks):
+    provider = _make_provider()
+    with (
+        patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=AsyncStreamMock(chunks),
+        ),
+        patch.object(
+            provider._rate_limiter,
+            "wait_if_blocked",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+    ):
+        return "".join(await _collect_stream(provider, _make_request()))
+
+
+def _stop_reason(text):
+    return json.loads(text.split("event: message_delta\ndata: ")[1].split("\n")[0])[
+        "delta"
+    ]["stop_reason"]
+
+
+class TestToolCallStream:
+    """Tool calls must survive provider quirks and end with stop_reason tool_use."""
+
+    @pytest.mark.asyncio
+    async def test_id_only_tool_delta_does_not_crash(self):
+        text = await _stream_chunks(
+            [
+                _make_chunk(tool_calls=[_tool_delta(id="call_1", function=False)]),
+                _make_chunk(
+                    tool_calls=[
+                        _tool_delta(name="Read", arguments='{"file_path": "a"}')
+                    ]
+                ),
+                _make_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert "Provider request failed" not in text
+        assert '"id": "call_1", "name": "Read"' in text
+        assert '"file_path' in text
+        assert _stop_reason(text) == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_name_streamed_in_fragments(self):
+        text = await _stream_chunks(
+            [
+                _make_chunk(tool_calls=[_tool_delta(id="c", name="Re")]),
+                _make_chunk(tool_calls=[_tool_delta(name="ad", arguments="{}")]),
+            ]
+        )
+        assert '"name": "Read"' in text
+        assert text.count('"type": "tool_use"') == 1
+
+    @pytest.mark.asyncio
+    async def test_tool_without_arguments_still_emitted(self):
+        text = await _stream_chunks(
+            [
+                _make_chunk(tool_calls=[_tool_delta(id="c", name="TodoRead")]),
+                _make_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert '"name": "TodoRead"' in text
+        assert _stop_reason(text) == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_read_from_chunk_without_delta(self):
+        last = _make_chunk(finish_reason="length")
+        last.choices[0].delta = None
+        text = await _stream_chunks([_make_chunk(content="Hi"), last])
+        assert _stop_reason(text) == "max_tokens"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            # native tool call, but the provider says "stop"
+            [
+                _make_chunk(
+                    tool_calls=[_tool_delta(id="c", name="Read", arguments="{}")]
+                ),
+                _make_chunk(finish_reason="stop"),
+            ],
+            # tool call written as text and parsed heuristically
+            [
+                _make_chunk(
+                    content="● <function=Read><parameter=file_path>a</parameter></function>"
+                ),
+                _make_chunk(finish_reason="stop"),
+            ],
+        ],
+        ids=["native_with_stop", "text_parsed"],
+    )
+    async def test_tool_calls_end_with_tool_use(self, chunks):
+        text = await _stream_chunks(chunks)
+        assert '"type": "tool_use"' in text
+        assert _stop_reason(text) == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_plain_text_still_ends_with_end_turn(self):
+        text = await _stream_chunks(
+            [_make_chunk(content="Hi"), _make_chunk(finish_reason="stop")]
+        )
+        assert _stop_reason(text) == "end_turn"
+
+
+class TestRaiseBeforeOutput:
+    """raise_before_output lets the route fall back to another model."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("chunks", "should_raise"),
+        [([], True), ([_make_chunk(content="Hello ")], False)],
+        ids=["before_output", "after_output"],
+    )
+    async def test_raises_only_before_any_content(self, chunks, should_raise):
+        provider = _make_provider()
+        stream_mock = AsyncStreamMock(chunks, error=RuntimeError("Connection lost"))
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = provider.stream_response(_make_request(), raise_before_output=True)
+            if should_raise:
+                with pytest.raises(Exception, match="Connection lost"):
+                    [e async for e in events]
+            else:
+                text = "".join([e async for e in events])
+                assert "Hello" in text
+                assert "Connection lost" in text
 
 
 class TestProcessToolCall:
@@ -456,7 +634,7 @@ class TestStreamChunkEdgeCases:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -492,7 +670,7 @@ class TestStreamChunkEdgeCases:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -506,7 +684,7 @@ class TestStreamChunkEdgeCases:
 
     @pytest.mark.asyncio
     async def test_stream_generator_cleanup_on_exception(self):
-        """When stream raises mid-iteration, message_stop still emitted."""
+        """When stream raises mid-iteration, the stream ends with an error event."""
         provider = _make_provider()
         request = _make_request()
 
@@ -523,7 +701,7 @@ class TestStreamChunkEdgeCases:
                 return_value=stream_mock,
             ),
             patch.object(
-                provider._global_rate_limiter,
+                provider._rate_limiter,
                 "wait_if_blocked",
                 new_callable=AsyncMock,
                 return_value=False,
@@ -534,7 +712,8 @@ class TestStreamChunkEdgeCases:
         event_text = "".join(events)
         assert "Partial" in event_text
         assert "Connection reset" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     def test_stream_malformed_tool_args_chunked(self):
         """Chunked tool args that never form valid JSON are flushed with {}."""
@@ -560,3 +739,11 @@ class TestStreamChunkEdgeCases:
         event_text = "".join(events1 + events2 + flushed)
         assert "tool_use" in event_text
         assert "{}" in event_text
+
+
+@pytest.mark.asyncio
+async def test_cleanup_closes_the_real_client():
+    """cleanup() must call a method AsyncOpenAI really has (it once called aclose)."""
+    provider = _make_provider()
+    await provider.cleanup()
+    assert provider._client.is_closed()

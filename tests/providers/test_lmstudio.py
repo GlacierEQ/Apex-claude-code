@@ -104,9 +104,9 @@ def lmstudio_config():
 
 @pytest.fixture(autouse=True)
 def mock_rate_limiter():
-    """Mock the global rate limiter to prevent waiting."""
-    with patch("providers.openai_compat.GlobalRateLimiter") as mock:
-        instance = mock.get_instance.return_value
+    """Mock the provider rate limiter to prevent waiting."""
+    with patch("providers.openai_compat.ProviderRateLimiter") as mock:
+        instance = mock.return_value
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
         async def _passthrough(fn, *args, **kwargs):
@@ -289,7 +289,8 @@ class TestLMStudioStreamingExceptionHandling:
         event_text = "".join(events)
         assert "message_start" in event_text
         assert "API failed" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     @pytest.mark.asyncio
     async def test_error_after_partial_content(self, lmstudio_provider):
@@ -311,7 +312,8 @@ class TestLMStudioStreamingExceptionHandling:
         event_text = "".join(events)
         assert "Hello" in event_text
         assert "Connection lost" in event_text
-        assert "message_stop" in event_text
+        assert "event: error" in event_text
+        assert "message_stop" not in event_text  # an error event ends the stream
 
     @pytest.mark.asyncio
     async def test_empty_response_gets_space(self, lmstudio_provider):
@@ -622,16 +624,45 @@ def test_build_request_body_stop_sequences(lmstudio_provider):
     assert body["stop"] == ["STOP", "END"]
 
 
-def test_build_request_body_tools_and_tool_choice(lmstudio_provider):
-    """tools and tool_choice non-empty add to body."""
+@pytest.mark.parametrize(
+    ("anthropic_choice", "openai_choice"),
+    [
+        ({"type": "auto"}, "auto"),
+        ({"type": "any"}, "required"),
+        ({"type": "none"}, "none"),
+        (
+            {"type": "tool", "name": "test_tool"},
+            {"type": "function", "function": {"name": "test_tool"}},
+        ),
+    ],
+)
+def test_build_request_body_tools_and_tool_choice(
+    lmstudio_provider, anthropic_choice, openai_choice
+):
+    """Anthropic tool_choice is mapped to the OpenAI format."""
     tool = MagicMock()
     tool.name = "test_tool"
     tool.description = "A test"
     tool.input_schema = {"type": "object"}
-    req = MockRequest(tools=[tool], tool_choice="auto")
+    req = MockRequest(tools=[tool], tool_choice=anthropic_choice)
     body = lmstudio_provider._build_request_body(req)
     assert "tools" in body
-    assert body["tool_choice"] == "auto"
+    assert body["tool_choice"] == openai_choice
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_choice"), [([], {"type": "any"}), ([MagicMock()], {"type": "x"})]
+)
+def test_build_request_body_skips_unusable_tool_choice(
+    lmstudio_provider, tools, tool_choice
+):
+    """No tools, or an unknown choice type, leaves tool_choice out."""
+    for tool in tools:
+        tool.name, tool.description, tool.input_schema = "t", "d", {"type": "object"}
+    body = lmstudio_provider._build_request_body(
+        MockRequest(tools=tools, tool_choice=tool_choice)
+    )
+    assert "tool_choice" not in body
 
 
 # --- Base URL Trailing Slash ---

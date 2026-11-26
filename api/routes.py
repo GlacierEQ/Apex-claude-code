@@ -3,23 +3,144 @@
 import json
 import traceback
 import uuid
+from collections.abc import AsyncIterator
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
+from starlette.types import Message, Send
 
-from config.settings import Settings
+from config.settings import MODEL_ID_PREFIX, VALID_PROVIDERS, Settings
 from providers.common import get_user_facing_error_message
-from providers.exceptions import InvalidRequestError, ProviderError
+from providers.exceptions import APIError, InvalidRequestError, ProviderError
 from providers.logging_utils import build_request_summary, log_request_compact
 
-from .dependencies import get_provider_for_type, get_settings
+from .dependencies import get_provider_for_type, get_settings, require_auth
 from .models.anthropic import MessagesRequest, TokenCountRequest
 from .models.responses import TokenCountResponse
 from .optimization_handlers import try_optimizations
 from .request_utils import get_token_count
 
 router = APIRouter()
+
+PING_MESSAGE: Message = {
+    "type": "http.response.body",
+    "body": b'event: ping\ndata: {"type": "ping"}\n\n',
+    "more_body": True,
+}
+
+
+class KeepAliveStreamingResponse(StreamingResponse):
+    """StreamingResponse that also sends an SSE ping every `ping_interval` seconds.
+
+    Claude Code aborts a stream after ~5 minutes without bytes, e.g. while a
+    request waits for a provider concurrency slot. The body is still iterated in
+    the response task, so client-disconnect cancellation works as before.
+    """
+
+    ping_interval = 15.0
+
+    async def stream_response(self, send: Send) -> None:
+        finished = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal finished
+            if message["type"] == "http.response.body" and not message.get(
+                "more_body", False
+            ):
+                finished = True  # no pings after the final body message
+            await send(message)
+
+        async def ping() -> None:
+            while True:
+                await anyio.sleep(self.ping_interval)
+                if not finished:
+                    await send(PING_MESSAGE)
+
+        # shortcut: errors leave as an ExceptionGroup; Starlette unwraps them on ASGI
+        # spec 2.3 (uvicorn), but not on 2.4 servers. Unwrap here if we support one.
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(ping)
+            await super().stream_response(tracking_send)
+            tg.cancel_scope.cancel()
+
+
+async def collect_message(events: AsyncIterator[str]) -> dict:
+    """Assemble streamed Anthropic SSE events into one Message (for stream=false)."""
+    message: dict = {}
+    blocks: dict[int, dict] = {}
+    tool_json: dict[int, list[str]] = {}
+    async for event in events:
+        name, _, data = event.strip().partition("\ndata: ")
+        payload = json.loads(data)
+        match name.removeprefix("event: "):
+            case "message_start":
+                message = payload["message"]
+            case "content_block_start":
+                blocks[payload["index"]] = payload["content_block"]
+            case "content_block_delta":
+                block, delta = blocks[payload["index"]], payload["delta"]
+                if delta["type"] == "input_json_delta":
+                    tool_json.setdefault(payload["index"], []).append(
+                        delta["partial_json"]
+                    )
+                for key in ("text", "thinking", "signature"):
+                    if key in delta:
+                        block[key] = block.get(key, "") + delta[key]
+            case "content_block_stop":
+                if payload["index"] in tool_json:
+                    raw = "".join(tool_json.pop(payload["index"]))
+                    blocks[payload["index"]]["input"] = json.loads(raw or "{}")
+            case "message_delta":
+                message.update(payload["delta"])
+                message.setdefault("usage", {}).update(payload.get("usage", {}))
+            case "error":
+                raise APIError(payload["error"]["message"])
+    message["content"] = [blocks[i] for i in sorted(blocks)]
+    return message
+
+
+async def stream_with_fallback(
+    request_data: MessagesRequest,
+    models: list[str],
+    first_events: AsyncIterator[str],
+    input_tokens: int,
+    request_id: str,
+    raise_on_last: bool = False,
+) -> AsyncIterator[str]:
+    """Relay `first_events`; if models[0] fails before any content, try the next model.
+
+    The last model streams its error to the client as usual.
+    """
+    for i, model in enumerate(models):
+        is_last = i == len(models) - 1
+        try:
+            events = first_events
+            if i:
+                provider = get_provider_for_type(Settings.parse_provider_type(model))
+                request_data.model = Settings.parse_model_name(model)
+                events = provider.stream_response(
+                    request_data,
+                    input_tokens=input_tokens,
+                    request_id=request_id,
+                    raise_before_output=raise_on_last or not is_last,
+                )
+            async for event in events:
+                # The client already got message_start from the first attempt.
+                if i and event.startswith("event: message_start"):
+                    continue
+                yield event
+            return
+        except Exception as e:
+            if is_last:
+                raise
+            logger.warning(
+                "MODEL_FALLBACK: {} failed before output ({}), trying {}",
+                model,
+                get_user_facing_error_message(e),
+                models[i + 1],
+            )
 
 
 # =============================================================================
@@ -30,10 +151,15 @@ async def create_message(
     request_data: MessagesRequest,
     raw_request: Request,
     settings: Settings = Depends(get_settings),
+    model_override: str | None = Depends(require_auth),
 ):
     """Create a message (always streaming)."""
 
     try:
+        if model_override:
+            request_data.resolved_provider_model = model_override
+            request_data.model = Settings.parse_model_name(model_override)
+
         if not request_data.messages:
             raise InvalidRequestError("messages cannot be empty")
 
@@ -41,11 +167,9 @@ async def create_message(
         if optimized is not None:
             return optimized
 
-        # Resolve provider from the model-aware mapping
-        provider_type = Settings.parse_provider_type(
-            request_data.resolved_provider_model or settings.model
-        )
-        provider = get_provider_for_type(provider_type)
+        # Resolve the provider of the first model now, so misconfiguration is a 503.
+        models = (request_data.resolved_provider_model or settings.model).split(",")
+        provider = get_provider_for_type(Settings.parse_provider_type(models[0]))
 
         request_id = f"req_{uuid.uuid4().hex[:12]}"
         log_request_compact(logger, request_id, request_data)
@@ -53,11 +177,27 @@ async def create_message(
         input_tokens = get_token_count(
             request_data.messages, request_data.system, request_data.tools
         )
-        return StreamingResponse(
-            provider.stream_response(
+        streaming = request_data.stream is not False
+        first_events = provider.stream_response(
+            request_data,
+            input_tokens=input_tokens,
+            request_id=request_id,
+            # Non-streaming: an error before output becomes a real HTTP error status.
+            raise_before_output=len(models) > 1 or not streaming,
+        )
+        if not streaming:
+            events = stream_with_fallback(
                 request_data,
-                input_tokens=input_tokens,
-                request_id=request_id,
+                models,
+                first_events,
+                input_tokens,
+                request_id,
+                raise_on_last=True,
+            )
+            return JSONResponse(await collect_message(events))
+        return KeepAliveStreamingResponse(
+            stream_with_fallback(
+                request_data, models, first_events, input_tokens, request_id
             ),
             media_type="text/event-stream",
             headers={
@@ -77,7 +217,7 @@ async def create_message(
         ) from e
 
 
-@router.post("/v1/messages/count_tokens")
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(require_auth)])
 async def count_tokens(request_data: TokenCountRequest):
     """Count tokens for a request."""
     request_id = f"req_{uuid.uuid4().hex[:12]}"
@@ -113,13 +253,55 @@ async def root(settings: Settings = Depends(get_settings)):
     }
 
 
+@router.get("/v1/models", dependencies=[Depends(require_auth)])
+async def list_models(
+    catalog: str | None = None, settings: Settings = Depends(get_settings)
+):
+    """Configured models, for Claude Code's /model picker (gateway model discovery).
+
+    With ?catalog=<provider>, every model that provider offers (used by claude-pick).
+    """
+    if catalog is None:
+        models = {
+            m: ", ".join(uses) for m, uses in settings.configured_models().items()
+        }
+    else:
+        if catalog not in VALID_PROVIDERS:
+            raise HTTPException(400, f"Unknown provider {catalog!r}")
+        provider = get_provider_for_type(catalog)  # 503 if its key is missing
+        try:
+            ids = await provider.list_models()
+        except Exception as e:
+            raise HTTPException(
+                502,
+                f"Could not list {catalog} models: {get_user_facing_error_message(e)}",
+            ) from e
+        models = {f"{catalog}/{model_id}": catalog for model_id in ids}
+    data = [
+        {
+            "type": "model",
+            "id": f"{MODEL_ID_PREFIX}{model}",
+            "display_name": model,
+            "description": description,
+            "created_at": "1970-01-01T00:00:00Z",
+        }
+        for model, description in models.items()
+    ]
+    return {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
+
+
 @router.get("/health")
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(require_auth)])
 async def stop_cli(request: Request):
     """Stop all CLI sessions and pending tasks."""
     handler = getattr(request.app.state, "message_handler", None)
